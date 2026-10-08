@@ -1,9 +1,9 @@
 """
 Obscura Lexer
 =================
-Full Luau tokenizer producing a stream of typed tokens with position tracking.
-Handles: keywords, identifiers, numbers, strings (single/double/long/interpolated),
-operators, comments, and Luau-specific syntax.
+Tokenizer for the supported Luau syntax with position tracking.
+Handles keywords, identifiers, numbers, quoted/long strings, operators and
+comments. Unsupported characters fail instead of silently changing source.
 """
 
 from enum import Enum, auto
@@ -317,16 +317,59 @@ class Lexer:
                 self.col += 1
                 if self.pos < len(self.source):
                     esc = self.source[self.pos]
-                    result.append('\\' + esc)
                     self.pos += 1
                     self.col += 1
-                    # Handle numeric escapes \123
+                    escapes = {'a':'\a','b':'\b','f':'\f','n':'\n','r':'\r',
+                               't':'\t','v':'\v','\\':'\\','"':'"',"'":"'"}
                     if esc.isdigit():
+                        digits = esc
                         for _ in range(2):
                             if self.pos < len(self.source) and self.source[self.pos].isdigit():
-                                result[-1] += self.source[self.pos]
+                                digits += self.source[self.pos]
                                 self.pos += 1
                                 self.col += 1
+                        byte = int(digits)
+                        if byte > 255:
+                            raise LexerError('Byte escape exceeds 255',self.line,self.col)
+                        result.append(chr(byte if byte < 128 else 0xDC00+byte))
+                    elif esc == 'x':
+                        digits = self.source[self.pos:self.pos+2]
+                        if len(digits)!=2 or any(c not in '0123456789abcdefABCDEF' for c in digits):
+                            raise LexerError('Invalid hex escape',self.line,self.col)
+                        byte=int(digits,16)
+                        result.append(chr(byte if byte < 128 else 0xDC00+byte))
+                        self.pos += 2
+                        self.col += 2
+                    elif esc == 'u':
+                        end=self.source.find('}',self.pos)
+                        if self.pos>=len(self.source) or self.source[self.pos]!='{' or end<0:
+                            raise LexerError('Invalid Unicode escape',self.line,self.col)
+                        try:
+                            value=int(self.source[self.pos+1:end],16)
+                            if 0xD800 <= value <= 0xDFFF:
+                                raise ValueError('Surrogate code point')
+                            result.append(chr(value))
+                        except ValueError:
+                            raise LexerError('Invalid Unicode escape',self.line,self.col)
+                        self.col += end+1-self.pos
+                        self.pos=end+1
+                    elif esc == 'z':
+                        while self.pos<len(self.source) and self.source[self.pos].isspace():
+                            if self.source[self.pos]=='\n':
+                                self.line+=1
+                                self.col=0
+                            self.pos+=1
+                            self.col+=1
+                    elif esc in ('\n','\r'):
+                        if esc=='\r' and self.pos<len(self.source) and self.source[self.pos]=='\n':
+                            self.pos+=1
+                        result.append('\n')
+                        self.line+=1
+                        self.col=1
+                    elif esc in escapes:
+                        result.append(escapes[esc])
+                    else:
+                        raise LexerError('Invalid string escape',self.line,self.col)
             elif ch == quote:
                 self.pos += 1
                 self.col += 1
@@ -424,6 +467,6 @@ class Lexer:
             self.tokens.append(Token(one_map[ch], ch, start_line, start_col))
             self.pos += 1; self.col += 1; return
 
-        # Unknown character — skip (Luau type annotations, etc.)
-        self.pos += 1
-        self.col += 1
+        if ch == '`':
+            raise LexerError('Interpolated strings are not supported', start_line, start_col)
+        raise LexerError(f'Unsupported character {ch!r}', start_line, start_col)

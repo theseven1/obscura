@@ -7,6 +7,7 @@ Register-based function prototype with upvalue descriptors and nested protos.
 from dataclasses import dataclass, field
 from typing import List, Optional
 from .instruction import Instruction
+from .constant_pool import ConstantPool
 
 
 @dataclass
@@ -36,6 +37,8 @@ class FunctionPrototype:
     upvalues: List[UpvalueDesc] = field(default_factory=list)
     sub_protos: List['FunctionPrototype'] = field(default_factory=list)
     line_info: List[int] = field(default_factory=list)  # parallel to instructions
+    constant_pool: Optional[ConstantPool] = None
+    bytecode_key: List[int] = field(default_factory=list)
 
     def add_proto(self, proto: 'FunctionPrototype') -> int:
         """Add a nested function prototype, return its index."""

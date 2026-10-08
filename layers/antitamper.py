@@ -215,15 +215,15 @@ class AntiTamperInjector:
         ]))]
 
     def _wrap_in_iife(self, block: Block) -> Block:
-        """Wrap entire code in do local _ = (function() ... end)() end to prevent syntax errors."""
-        iife = LocalStatement(
-            names=['_'],
+        """Isolate locals while forwarding chunk arguments and return values."""
+        iife = ReturnStatement(
             values=[FunctionCall(
                 func=ParenExpr(expression=FunctionExpr(
                     params=[],
+                    has_vararg=True,
                     body=block
                 )),
-                args=[]
+                args=[VarargExpr()]
             )]
         )
         # Wrap the IIFE inside a `do ... end` block to prevent ambiguous parsing

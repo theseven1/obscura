@@ -3,7 +3,7 @@ Obscura VM Opcodes
 ======================
 Register-based instruction set with per-build randomized values AND
 multiple aliases per semantic opcode (multiple distinct byte values that
-map to the same handler). Defeats opcode-frequency analysis.
+map to the same handler), optional fused operations and per-operation schemas.
 """
 
 import random
@@ -11,8 +11,8 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Tuple
 
 from .instruction import (
-    FORMAT_NONE, FORMAT_A, FORMAT_AB, FORMAT_ABC,
-    FORMAT_ABX, FORMAT_ASBX, FORMAT_SBX, instruction_size,
+    FORMAT_NONE, FORMAT_A, FORMAT_AB, FORMAT_ABC, FORMAT_ABCD,
+    FORMAT_ABX, FORMAT_ASBX, FORMAT_SBX, instruction_size, operand_count,
 )
 
 
@@ -68,6 +68,7 @@ INSTRUCTION_DEFS: List[Tuple[str, str, int]] = [
     ('FORPREP',   FORMAT_ASBX, 1),
     ('FORLOOP',   FORMAT_ASBX, 1),
     ('TFORLOOP',  FORMAT_ABC,  1),
+    ('TFORPREP',  FORMAT_A,    1),
 
     # Closures / varargs
     ('CLOSURE',   FORMAT_ABX,  2),
@@ -88,6 +89,9 @@ class OpcodeInfo:
     name: str
     fmt: str
     aliases: List[int] = field(default_factory=list)
+    layout: Tuple[int, ...] = ()
+    byte_order: str = 'little'
+    components: Tuple[str, ...] = ()
 
     @property
     def primary(self) -> int:
@@ -102,24 +106,69 @@ class OpcodeMap:
 
     _RESERVED = {0}
 
-    def __init__(self, rng: random.Random):
+    def __init__(self, rng: random.Random, *, diversify=False, fusion=False, extended=False, handler_variants=False):
         self.rng = rng
         self.opcodes: Dict[str, OpcodeInfo] = {}
         self._by_value: Dict[int, OpcodeInfo] = {}
+        self.definitions = list(INSTRUCTION_DEFS)
+        if fusion:
+            operations = ['ADD','SUB','MUL','DIV'] + (['MOD','POW'] if extended else [])
+            for op in operations:
+                self.definitions.append(('F'+op+'R', FORMAT_ABCD, 2))
+                if extended:
+                    self.definitions.append(('F'+op+'L', FORMAT_ABCD, 2))
+        self.diversify = diversify
+        self.table_flush_width = rng.choice((17,23,31,47,61)) if handler_variants else 50
+        self._blocks = {}
+        self._block_limit = 96 if extended else 48
         self._generate()
 
+    def block(self, names):
+        """Allocate a build-specific opcode/schema for an operation sequence.
+
+        Bound generated handler growth and retain ordinary opcodes when the
+        budget is full. A sequence is shared only within this output's map.
+        """
+        names = tuple(names)
+        if names in self._blocks:
+            return self._blocks[names]
+        available = [v for v in range(1,256) if v not in self._by_value]
+        if len(self._blocks) >= self._block_limit or not available:
+            return None
+        count = sum(operand_count(self.get(name).fmt) for name in names)
+        if count > 16:
+            return None
+        name = 'BLOCK'+str(len(self._blocks))
+        info = OpcodeInfo(name=name,fmt='X'+str(count),
+            aliases=[self.rng.choice(available)],components=names)
+        layout = list(range(count))
+        self.rng.shuffle(layout)
+        info.layout = tuple(layout)
+        info.byte_order = self.rng.choice(('little','big'))
+        self.opcodes[name] = info
+        self._by_value[info.primary] = info
+        self._blocks[names] = info
+        return info
+
     def _generate(self):
-        total_aliases = sum(count for _, _, count in INSTRUCTION_DEFS)
+        total_aliases = sum(count for _, _, count in self.definitions)
         available = [v for v in range(1, 256) if v not in self._RESERVED]
         if total_aliases > len(available):
             raise RuntimeError(f"Too many opcode aliases: {total_aliases} > {len(available)}")
 
         chosen = self.rng.sample(available, total_aliases)
         idx = 0
-        for name, fmt, count in INSTRUCTION_DEFS:
+        for name, fmt, count in self.definitions:
             aliases = chosen[idx:idx + count]
             idx += count
             info = OpcodeInfo(name=name, fmt=fmt, aliases=aliases)
+            layout = list(range(operand_count(fmt)))
+            # Closure link records share this stable two-operand schema;
+            # the CLOSURE handler consumes them without a normal dispatch.
+            if self.diversify and name not in ('MOVE','GETUPVAL'):
+                self.rng.shuffle(layout)
+                info.byte_order = self.rng.choice(('little','big'))
+            info.layout = tuple(layout)
             self.opcodes[name] = info
             for v in aliases:
                 self._by_value[v] = info

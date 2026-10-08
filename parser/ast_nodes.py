@@ -49,6 +49,12 @@ class AssignStatement(Node):
 
 
 @dataclass
+class CompoundAssignStatement(AssignStatement):
+    """Luau compound assignment; its destination evaluates once."""
+    op: str = "+"
+
+
+@dataclass
 class DoBlock(Node):
     """do ... end"""
     body: 'Block' = field(default_factory=Block)

@@ -47,6 +47,15 @@ class Obfuscator:
         Returns the obfuscated Luau source.
         """
         try:
+            # Native output can retain the source's explicit Roblox compiler
+            # directives. A custom VM is a separate execution strategy.
+            directives = []
+            for line in source.splitlines():
+                directive = line.strip()
+                if directive in ('--!native','--!optimize 0','--!optimize 1','--!optimize 2'):
+                    directives.append(directive)
+                elif directive and not directive.startswith('--'):
+                    break
             # Pre-processing: strip Luau type annotations
             if self.config.strip_types:
                 source = self._strip_types(source)
@@ -60,7 +69,10 @@ class Obfuscator:
                 return self._obfuscate_vm(source)
 
             # Standard pipeline: parse → transform → emit
-            return self._obfuscate_standard(source)
+            output = self._obfuscate_standard(source)
+            if directives:
+                output = '\n'.join(dict.fromkeys(directives)) + '\n' + output
+            return output
 
         except Exception as e:
             raise ObfuscationError(f"Obfuscation failed: {e}") from e
@@ -159,7 +171,7 @@ class Obfuscator:
         # chunk receives the script-level varargs (Roblox passes none, but
         # standalone Lua may).
         if self.config.wrap_in_iife:
-            final_code = f"(function(...) {final_code} end)(...)"
+            final_code = f"return (function(...) {final_code} end)(...)"
 
         # Ensure everything after the header is on a single line
         final_code = final_code.replace('\n', ' ').replace('\r', ' ')
@@ -173,16 +185,22 @@ class Obfuscator:
         Remove Luau type declarations (type/export type) from source code.
         Inline annotations are handled by the parser's lexer.
         """
-        source = re.sub(r'^\s*type\s+\w+\s*=\s*[^\n]+', '', source, flags=re.MULTILINE)
-        source = re.sub(r'^\s*export\s+type\s+\w+\s*=\s*[^\n]+', '', source, flags=re.MULTILINE)
-        return source
+        # Match strings/comments first so text that resembles a declaration
+        # inside a payload is never removed. Declarations remain single-line.
+        pattern = re.compile(
+            r'--\[(?P<comment_equals>=*)\[.*?\](?P=comment_equals)\]'
+            r'|--[^\n]*'
+            r'|\[(?P<string_equals>=*)\[.*?\](?P=string_equals)\]'
+            r'|"(?:\\[\s\S]|[^"\\])*"'
+            r"|'(?:\\[\s\S]|[^'\\])*'"
+            r'|(?P<alias>^[ \t]*(?:export[ \t]+)?type[ \t]+\w+[ \t]*=[^\n]+)',
+            re.MULTILINE | re.DOTALL,
+        )
+        return pattern.sub(lambda match: ' ' * len(match[0])
+                           if match.group('alias') is not None else match[0], source)
 
     def _strip_comments(self, source: str) -> str:
-        """Remove all Luau comments (single-line and block)."""
-        # Remove long comments first: --[[ ... ]]
-        source = re.sub(r'--\[=*\[.*?\]=*\]', '', source, flags=re.DOTALL)
-        # Remove single-line comments: -- ...
-        source = re.sub(r'--[^\n]*', '', source)
+        """The lexer discards comments while preserving comment-like strings."""
         return source
 
 

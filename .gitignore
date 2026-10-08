@@ -1,26 +1,17 @@
-# Python
+# Python and local settings
 __pycache__/
 *.py[cod]
-*$py.class
 .pytest_cache/
-.coverage
-htmlcov/
-
-# Environments
-.env
-.venv
-env/
+.venv/
 venv/
-ENV/
-
-# IDEs
+.env
 .vscode/
 .idea/
 
-# Project Specific
-script.lua
-output.lua
-output_vm.lua
+# Generated output and local tools
 *.obf.lua
-scripts/obfuscated/
-tests/results/
+*.obf.luau
+*-obfuscated/
+/dist/
+/artifacts/
+/tests/runtime/

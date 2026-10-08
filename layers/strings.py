@@ -55,6 +55,26 @@ return {out_var}
 end
 end)()'''
 
+# Eager mode does not need a Base64 transport or lookup table: the emitter can
+# represent encrypted bytes directly using padded decimal escapes. Decode one
+# byte per iteration, keeping the same per-string key schedule.
+EAGER_DECODER_TEMPLATE = '''local {decoder_name}=(function()
+local {key_var}={key_table}
+for {i_var}=1,#{key_var} do {key_var}[{i_var}]=bit32.bxor({key_var}[{i_var}],{key_mask}) end
+return function({s_var},{token_var},{idx_var})
+local {seedpack_var}=bit32.bxor({token_var},{token_mask}+{idx_var}*131)
+local {seed_var}=math.floor({seedpack_var}/256)
+local {step_var}={seedpack_var}-{seed_var}*256
+local {result_var}=table.create and table.create(#{s_var}) or {{}}
+for {ri_var}=1,#{s_var} do
+local {key_idx_var}=(({ri_var}+{seed_var}+{idx_var})%#{key_var})+1
+local {dyn_key_var}=({seed_var}+{ri_var}*{step_var}+{key_var}[{key_idx_var}]+{idx_var}*17)%256
+{result_var}[{ri_var}]=string.char(bit32.bxor(string.byte({s_var},{ri_var}),{dyn_key_var}))
+end
+return table.concat({result_var})
+end
+end)()'''
+
 
 class StringEncryptor:
     """Encrypts all string literals in the AST."""
@@ -64,6 +84,8 @@ class StringEncryptor:
         self.rng = config.get_rng()
         self.name_gen = NameGenerator(rng=self.rng, min_length=8, max_length=12)
         self.strings: List[Tuple[str, str, int, int]] = []
+        self._indices = {}
+        self._bindings = {}
         self.decoder_name = self.name_gen.gen_name()
         self.table_name = self.name_gen.gen_name()
         self.index_key = self.rng.randint(1, 0xFFFF)
@@ -73,6 +95,39 @@ class StringEncryptor:
 
     def apply(self, block: Block) -> Block:
         """Apply string encryption to the AST."""
+        if self.config.string_decode_mode not in ('lazy', 'eager'):
+            raise ValueError('string_decode_mode must be lazy or eager')
+        # Keep room for source locals and the decoder's temporary registers.
+        root_locals = sum(len(s.names) if isinstance(s,LocalStatement) else 1
+                          for s in block.body if isinstance(s,LocalStatement)
+                          or isinstance(s,FunctionDecl) and s.is_local)
+        self._binding_budget = min(64, max(0, 150-root_locals))
+        # Eager scalar bindings become additional upvalues in user closures.
+        # A closure already near Luau's 200-upvalue limit must use one pool
+        # reference instead. Count all referenced names conservatively (also
+        # counting globals and nested bodies) to leave room for helper state.
+        def children(node):
+            for value in vars(node).values():
+                if isinstance(value, Node):
+                    yield value
+                elif isinstance(value, list):
+                    yield from (item for item in value if isinstance(item, Node))
+
+        def references(node):
+            names = {node.name} if isinstance(node, Identifier) else set()
+            for child in children(node):
+                names.update(references(child))
+            return names
+
+        def limit_bindings(node):
+            if isinstance(node, (FunctionDecl, FunctionExpr)):
+                self._binding_budget = min(self._binding_budget,
+                                           max(0, 190-len(references(node.body))))
+            for child in children(node):
+                limit_bindings(child)
+
+        if self.config.string_decode_mode == 'eager':
+            limit_bindings(block)
         # Collect and encrypt all strings
         self._collect_strings(block)
 
@@ -112,11 +167,25 @@ class StringEncryptor:
 
     def _replace_string(self, parent: Node, attr_name: str, string_node: StringLiteral):
         """Replace a string literal with a decoder call."""
-        idx = len(self.strings) + 1
-        encrypted, token = self._encrypt_string(string_node.value, idx)
-        self.strings.append((string_node.value, encrypted, token, idx))
+        setattr(parent, attr_name, self._string_expr(string_node))
 
-        call = FunctionCall(
+    def _string_expr(self, string_node: StringLiteral) -> Node:
+        idx = self._indices.get(string_node.value)
+        if idx is None:
+            idx = len(self.strings) + 1
+            encrypted, token = self._encrypt_string(string_node.value, idx)
+            self.strings.append((string_node.value, encrypted, token, idx))
+            self._indices[string_node.value] = idx
+            if self.config.string_decode_mode == 'eager' and len(self._bindings) < self._binding_budget:
+                self._bindings[idx] = self.name_gen.gen_name()
+        token = self.strings[idx - 1][2]
+        if self.config.string_decode_mode == 'eager':
+            if idx in self._bindings:
+                return Identifier(name=self._bindings[idx], line=string_node.line, col=string_node.col)
+            return IndexExpr(object=Identifier(name=self.table_name),
+                             index=NumberLiteral(value=str(idx)),
+                             line=string_node.line, col=string_node.col)
+        return FunctionCall(
             func=Identifier(name=self.decoder_name),
             args=[
                 IndexExpr(
@@ -128,38 +197,26 @@ class StringEncryptor:
             ],
             line=string_node.line, col=string_node.col
         )
-        setattr(parent, attr_name, call)
 
     def _replace_string_in_list(self, lst: list, idx: int, string_node: StringLiteral):
         """Replace a string literal in a list with a decoder call."""
-        str_idx = len(self.strings) + 1
-        encrypted, token = self._encrypt_string(string_node.value, str_idx)
-        self.strings.append((string_node.value, encrypted, token, str_idx))
-
-        call = FunctionCall(
-            func=Identifier(name=self.decoder_name),
-            args=[
-                IndexExpr(
-                    object=Identifier(name=self.table_name),
-                    index=self._make_index_expr(str_idx)
-                ),
-                NumberLiteral(value=str(token)),
-                self._make_index_expr(str_idx)
-            ],
-            line=string_node.line, col=string_node.col
-        )
-        lst[idx] = call
+        lst[idx] = self._string_expr(string_node)
 
     def _encrypt_string(self, value: str, idx: int) -> Tuple[str, int]:
         seed = self.rng.randint(1, 255)
         step = self.rng.randrange(1, 252, 2)
         encrypted = []
-        for pos, byte in enumerate(value.encode('utf-8'), start=1):
+        for pos, byte in enumerate(value.encode('utf-8','surrogateescape'), start=1):
             key_byte = self.master_key[(pos + seed + idx) % len(self.master_key)]
             dyn_key = (seed + pos * step + key_byte + idx * 17) % 256
             encrypted.append(byte ^ dyn_key)
         token = ((seed * 256 + step) ^ (self.token_mask + idx * 131))
-        return b64_encode(bytes(encrypted)), token
+        payload = bytes(encrypted)
+        if self.config.string_decode_mode == 'eager':
+            # Surrogateescape lets the byte-aware emitter preserve invalid
+            # UTF-8 and embedded NUL bytes without re-encoding them.
+            return payload.decode('utf-8', 'surrogateescape'), token
+        return b64_encode(payload), token
 
     def _make_index_expr(self, idx: int) -> FunctionCall:
         return FunctionCall(
@@ -192,6 +249,24 @@ class StringEncryptor:
             values=[TableConstructor(fields=fields)]
         )
         stmts.append(table_stmt)
+
+        if self.config.string_decode_mode == 'eager':
+            # Startup-only scope: user code reads the decoded pool directly.
+            body = [ExpressionStatement(expression=Identifier(name=self._generate_decoder()))]
+            for _, _, token, idx in self.strings:
+                def entry():
+                    return IndexExpr(object=Identifier(name=self.table_name),
+                                     index=NumberLiteral(value=str(idx)))
+                body.append(AssignStatement(targets=[entry()],values=[FunctionCall(
+                    func=Identifier(name=self.decoder_name),
+                    args=[entry(), NumberLiteral(value=str(token)), NumberLiteral(value=str(idx))])]))
+            stmts.append(DoBlock(body=Block(body=body)))
+            for idx,name in self._bindings.items():
+                stmts.append(LocalStatement(names=[name],values=[IndexExpr(
+                    object=Identifier(name=self.table_name),index=NumberLiteral(value=str(idx)))]))
+            if len(self._bindings) == len(self.strings):
+                stmts.append(AssignStatement(targets=[Identifier(name=self.table_name)],values=[NilLiteral()]))
+            return stmts
 
         # The decoder is injected as raw Luau via a special marker node
         # We use the template with all variable names obfuscated
@@ -235,5 +310,8 @@ class StringEncryptor:
             'token_mask': self.token_mask,
             'key_mask': self.key_mask,
         }
-        return DECODER_TEMPLATE.format(**names)
+        template = DECODER_TEMPLATE
+        if self.config.string_decode_mode == 'eager':
+            template = EAGER_DECODER_TEMPLATE
+        return template.format(**names)
 

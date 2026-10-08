@@ -21,6 +21,7 @@ from parser.ast_nodes import *
 from .opcodes import OpcodeMap
 from .constant_pool import ConstantPool
 from .proto import FunctionPrototype, UpvalueDesc
+from .optimizer import relocate_and_fuse
 from .instruction import (
     Instruction, encode_instruction, instruction_size,
     FORMAT_NONE, FORMAT_A, FORMAT_AB, FORMAT_ABC,
@@ -36,6 +37,7 @@ import re
 
 # Sentinel for "all results to top" used in CALL / RETURN / VARARG / SETLIST.
 MULTRET = 0
+DISCARD = -1
 
 
 class VMCompilationError(Exception):
@@ -68,7 +70,8 @@ class _FuncState:
         self.upvalue_index: Dict[str, int] = {}
         # Loop patch lists
         self.break_lists: List[List[int]] = []      # stack of pending break PCs
-        self.continue_targets: List[int] = []        # stack of continue jump targets
+        self.continue_targets: List[int | List[Instruction]] = []
+        self.byte_offset = 0
         # Captured-locals analysis: names of locals declared in this function
         # that are referenced by inner closures.
         self.captured_names: set = set()
@@ -118,7 +121,7 @@ class _FuncState:
         # Drop locals introduced inside this scope
         del self.actvars[target:]
         # Free their registers
-        self.free_reg = max(target, 0)
+        self.free_reg = self._local_watermark()
         if self.free_reg > self.max_stack:
             self.max_stack = self.free_reg
 
@@ -149,7 +152,10 @@ class VMCompiler:
     def __init__(self, config: ObfuscationConfig):
         self.config = config
         self.rng = config.get_rng()
-        self.opcodes = OpcodeMap(self.rng)
+        self.opcodes = OpcodeMap(self.rng,diversify=config.vm_operand_layouts,
+                                 fusion=config.vm_fuse_instructions,extended=config.vm_extended_fusion,
+                                 handler_variants=config.vm_handler_variants)
+        self._FPF = self.opcodes.table_flush_width
         self.pool = ConstantPool(self.rng)
         self.fs: Optional[_FuncState] = None
 
@@ -210,6 +216,7 @@ class VMCompiler:
         # Implicit return
         self._emit('RETURN', a=0, b=1)  # B=1 -> return 0 values
         proto = self._leave_function()
+        self._finalize_proto(proto)
         return proto
 
     # =================================================================
@@ -231,8 +238,9 @@ class VMCompiler:
         # Names declared *in this function so far*
         scope_locals = set(declared_outside)
         # Names declared in this function only (not inherited)
-        own_locals = set(declared_outside)  # used as base; we'll diff at end
-        own_introduced: set = set()
+        # Parameters belong to this function too and must be boxed if an inner
+        # closure references them (including through another nested closure).
+        own_introduced: set = set(declared_outside)
 
         def visit(node, scope: set):
             if node is None:
@@ -374,7 +382,9 @@ class VMCompiler:
                 for v in node.values: visit(v, scope)
                 return
             if isinstance(node, ReturnStatement):
-                for v in node.values: visit(v, scope); return
+                for v in node.values:
+                    visit(v, scope)
+                return
             if isinstance(node, ExpressionStatement):
                 visit(node.expression, scope); return
             # Generic walker for expressions
@@ -422,10 +432,31 @@ class VMCompiler:
     def _leave_function(self) -> FunctionPrototype:
         proto = self.fs.proto
         proto.max_stacksize = max(self.fs.max_stack, 2)
-        # Encode bytecode
-        proto.bytecode = self._encode_proto(proto)
         self.fs = self.fs.parent
         return proto
+
+    def _finalize_proto(self, proto: FunctionPrototype):
+        for child in proto.sub_protos:
+            self._finalize_proto(child)
+        if self.config.vm_partition_constants:
+            # The symbolic instructions still refer to the compilation pool.
+            # Each function gets its own shuffled inventory and independent key.
+            fields = {'LOADK':'b','GETGLOBAL':'b','SETGLOBAL':'b',
+                      'GETTABLEK':'c','SETTABLEK':'b','SELF':'c'}
+            indices = list(dict.fromkeys(getattr(ins,fields[ins.op_name])
+                                        for ins in proto.instructions if ins.op_name in fields))
+            self.rng.shuffle(indices)
+            pool = ConstantPool(self.rng)
+            mapping = {index:pool.add(self.pool.constants[index]) for index in indices}
+            for ins in proto.instructions:
+                if ins.op_name in fields:
+                    field = fields[ins.op_name]
+                    setattr(ins,field,mapping[getattr(ins,field)])
+            proto.constant_pool = pool
+        relocate_and_fuse(proto,self.opcodes,self.rng,
+                          fuse=self.config.vm_fuse_instructions,extended=self.config.vm_extended_fusion,
+                          blocks=self.config.vm_superinstructions)
+        proto.bytecode = self._encode_proto(proto)
 
     def _encode_proto(self, proto: FunctionPrototype) -> List[int]:
         """Produce the flat byte stream for the proto's instructions."""
@@ -433,7 +464,10 @@ class VMCompiler:
         # Two-pass: first pass assigned PCs already during emission.
         for ins in proto.instructions:
             opbyte = self.opcodes.random_alias(ins.op_name)
-            out.extend(encode_instruction(opbyte, ins.fmt, ins.a, ins.b, ins.c))
+            info = self.opcodes.get(ins.op_name)
+            out.extend(encode_instruction(opbyte, ins.fmt, ins.a, ins.b, ins.c, ins.d,
+                                          layout=info.layout,byte_order=info.byte_order,
+                                          signed_b=ins.op_name=='TFORLOOP',values=ins.operand_values()))
         return out
 
     # =================================================================
@@ -443,15 +477,13 @@ class VMCompiler:
     def _current_pc(self) -> int:
         """Return current byte-offset within the function being compiled."""
         # PC is in bytes for jump-offset arithmetic.
-        pc = 0
-        for ins in self.fs.proto.instructions:
-            pc += instruction_size(ins.fmt)
-        return pc
+        return self.fs.byte_offset
 
     def _emit(self, op_name: str, a: int = 0, b: int = 0, c: int = 0) -> Instruction:
         fmt = self.opcodes.fmt_of(op_name)
         ins = Instruction(op_name=op_name, fmt=fmt, a=a, b=b, c=c, pc=self._current_pc())
         self.fs.proto.instructions.append(ins)
+        self.fs.byte_offset += instruction_size(fmt)
         return ins
 
     def _patch_jump(self, ins: Instruction, target_pc: int):
@@ -599,10 +631,31 @@ class VMCompiler:
     # ---- Assignment: a, t.x, t[k] = ... ----
 
     def _compile_assign(self, node: AssignStatement):
+        if isinstance(node, CompoundAssignStatement):
+            self._compile_compound_assign(node)
+            return
         n_targets = len(node.targets)
         n_vals = len(node.values)
 
-        # Evaluate all values into a contiguous register block, then assign.
+        saved = self.fs.free_reg
+        # Luau evaluates computed destinations before the RHS. Direct local
+        # references remain live through RHS calls, then must be snapshotted
+        # before any assignment can overwrite an object or index.
+        def destination(expr):
+            if isinstance(expr, Identifier) and self.fs.find_local_var(expr.name) is not None:
+                return expr
+            return self._expr_to_next_reg(expr)
+
+        destinations = []
+        for target in node.targets:
+            if isinstance(target, MemberExpr):
+                destinations.append((destination(target.object), self.pool.add(target.member)))
+            elif isinstance(target, IndexExpr):
+                destinations.append((destination(target.object), destination(target.index)))
+            else:
+                destinations.append(None)
+
+        # Keep destination temporaries below the contiguous RHS result block.
         base = self.fs.free_reg
 
         for i in range(n_vals - 1):
@@ -623,15 +676,61 @@ class VMCompiler:
         elif cur > need:
             self.fs.free_reg = need
 
-        # Assign each target from its source register, in REVERSE so that
-        # earlier assignments don't clobber later sources held in temps.
-        # But targets that use compound indexing need their object/key
-        # evaluated *now*, so we evaluate them after value computation.
-        for i in range(n_targets - 1, -1, -1):
+        def snapshot(value):
+            return self._expr_to_next_reg(value) if isinstance(value, Identifier) else value
+
+        destinations = [tuple(snapshot(value) for value in dest) if dest is not None else None
+                        for dest in destinations]
+        # Luau commits destinations in source order, including duplicate names
+        # and __newindex calls. All RHS values and indexed destinations are safe.
+        for i in range(n_targets):
             target = node.targets[i]
             src_reg = base + i
-            self._compile_assign_target(target, src_reg)
-        self.fs.free_reg = base  # release all value temps
+            dest = destinations[i]
+            if isinstance(target, MemberExpr):
+                self._emit('SETTABLEK', a=dest[0], b=dest[1], c=src_reg)
+            elif isinstance(target, IndexExpr):
+                self._emit('SETTABLE', a=dest[0], b=dest[1], c=src_reg)
+            else:
+                self._compile_assign_target(target, src_reg)
+        self.fs.free_reg = saved
+
+    def _compile_compound_assign(self, node: CompoundAssignStatement):
+        saved = self.fs.free_reg
+        target = node.targets[0]
+
+        def prepare(expr):
+            # Direct locals remain live through key/RHS calls in Luau. Computed
+            # expressions, globals and upvalues are evaluated once and retained.
+            if isinstance(expr, Identifier) and self.fs.find_local_var(expr.name) is not None:
+                return expr
+            return self._expr_to_next_reg(expr)
+
+        def read(value):
+            return self._expr_to_next_reg(value) if isinstance(value, Identifier) else value
+
+        if isinstance(target, (MemberExpr, IndexExpr)):
+            obj = prepare(target.object)
+            key = self.pool.add(target.member) if isinstance(target, MemberExpr) else prepare(target.index)
+            object_reg = read(obj)
+            key_reg = key if isinstance(target, MemberExpr) else read(key)
+            left = self.fs.reserve_regs(1)
+            self._emit('GETTABLEK' if isinstance(target, MemberExpr) else 'GETTABLE',
+                       a=left, b=object_reg, c=key_reg)
+        else:
+            left = self._expr_to_next_reg(target)
+
+        right = self._expr_to_next_reg(node.values[0])
+        if node.op == '..':
+            self._emit('CONCAT', a=left, b=left, c=right)
+        else:
+            self._emit(self._BIN_DIRECT[node.op], a=left, b=left, c=right)
+        if isinstance(target, (MemberExpr, IndexExpr)):
+            self._emit('SETTABLEK' if isinstance(target, MemberExpr) else 'SETTABLE',
+                       a=read(obj), b=key if isinstance(target, MemberExpr) else read(key), c=left)
+        else:
+            self._compile_assign_target(target, left)
+        self.fs.free_reg = saved
 
     def _compile_assign_target(self, target: Node, src_reg: int):
         if isinstance(target, Identifier):
@@ -672,7 +771,7 @@ class VMCompiler:
         # Most legal expression-statements are calls; result is discarded.
         if isinstance(expr, (FunctionCall, MethodCall)):
             base = self.fs.free_reg
-            self._compile_call(expr, want=0)  # 0 returns
+            self._compile_call(expr, want=DISCARD)
             self.fs.free_reg = base
         else:
             # Compile and discard
@@ -748,7 +847,7 @@ class VMCompiler:
         # Continue jumps to the until-condition test
         # We don't know that PC yet — use a forward-resolved patch list.
         cont_patches: List[Instruction] = []
-        self.fs.continue_targets.append(-1)  # marker; we use list below
+        self.fs.continue_targets.append(cont_patches)
 
         self.fs.enter_scope()
         # Save actvars count so continue can't escape locals
@@ -758,7 +857,7 @@ class VMCompiler:
         # Patch any pending continues
         for ins in cont_patches:
             self._patch_jump(ins, cond_pc)
-        # Replace any -1 marker in continue_targets with actual PC for naive uses
+        # Conditions are compiled after resolving all forward continue jumps.
         self.fs.continue_targets[-1] = cond_pc
 
         cond_reg = self._expr_to_any_reg(node.condition)
@@ -787,21 +886,18 @@ class VMCompiler:
         self.fs.break_lists.append([])
         self.fs.enter_scope()
 
-        base = self.fs.free_reg
-        # Eval start, stop, step into base..base+2
+        # Reserve the complete loop frame before evaluating expressions. A
+        # unary/call expression can allocate temps; those must not change the
+        # fixed base+3 slot written by FORLOOP.
+        base = self.fs.reserve_regs(4)
         self._expr_to_reg(node.start, base)
-        self.fs.reserve_regs(1)
         self._expr_to_reg(node.stop, base + 1)
-        self.fs.reserve_regs(1)
         if node.step is not None:
             self._expr_to_reg(node.step, base + 2)
         else:
             idx = self.pool.add(1)
             self._emit('LOADK', a=base + 2, b=idx)
-        self.fs.reserve_regs(1)
-
-        # Reserve loop var
-        i_reg = self.fs.reserve_regs(1)  # base + 3
+        i_reg = base + 3
         # Declare it as a local visible in the body
         captured = node.var_name in self.fs.captured_names
         loop_lv = _LocalVar(node.var_name, i_reg, captured=captured)
@@ -815,11 +911,14 @@ class VMCompiler:
         # iteration's value (Lua semantics).
         if captured:
             self._emit('MKBOX', a=i_reg, b=i_reg)
-        self.fs.continue_targets.append(body_start)  # not strictly needed
+        cont_patches: List[Instruction] = []
+        self.fs.continue_targets.append(cont_patches)
         self._compile_block(node.body)
 
         # FORLOOP base, sBx -> body_start
         forloop = self._emit('FORLOOP', a=base, b=0)
+        for ins in cont_patches:
+            self._patch_jump(ins, forloop.pc)
         self._patch_jump(forloop, body_start)
         # FORPREP jumps to the FORLOOP we just emitted
         self._patch_jump(forprep, forloop.pc)
@@ -856,6 +955,10 @@ class VMCompiler:
         elif cur > need:
             self.fs.free_reg = need
 
+        # Luau accepts a table or an __iter object as the iterator expression.
+        # Prepare once, before the body; continue/back edges skip this opcode.
+        self._emit('TFORPREP', a=base)
+
         # Declare user vars
         n_vars = len(node.names)
         var_base = self.fs.reserve_regs(n_vars)
@@ -869,6 +972,8 @@ class VMCompiler:
         # Jump over the body to the TFORLOOP test (Lua 5.1 layout)
         prep = self._emit_jump()
         body_start = self._current_pc()
+        cont_patches: List[Instruction] = []
+        self.fs.continue_targets.append(cont_patches)
         # Per-iteration box: each iteration of generic-for produces fresh boxes
         # for any captured loop variable so closures bind to that value.
         for lv in loop_lvs:
@@ -877,9 +982,11 @@ class VMCompiler:
         self._compile_block(node.body)
 
         self._patch_jump(prep, self._current_pc())
+        for ins in cont_patches:
+            self._patch_jump(ins, self._current_pc())
         # TFORLOOP A B C
         #   A = iterator base register
-        #   B = body start (sBx-like via instruction's c field reused as sBx)
+        #   B = signed byte offset back to the body start
         # We use the C field as count of vars and store the back-jump in B.
         tfor = self._emit('TFORLOOP', a=base, b=0, c=n_vars)
         # Compute back-jump offset: target = body_start, computed at patch time
@@ -889,6 +996,7 @@ class VMCompiler:
         end_pc = self._current_pc()
         for bp in self.fs.break_lists.pop():
             self._patch_jump(bp, end_pc)
+        self.fs.continue_targets.pop()
         self.fs.leave_scope()
 
     # ---- Return ----
@@ -923,20 +1031,10 @@ class VMCompiler:
         if not self.fs.continue_targets:
             raise VMCompilationError("'continue' outside of a loop")
         target = self.fs.continue_targets[-1]
-        if target < 0:
-            # Forward target (repeat-until): emit unpatched and rely on later patch
-            ins = self._emit_jump()
-            # We don't currently patch these in repeat; document gap.
-            # For now, treat continue in repeat as jump to loop start.
-            # (Repeat continue could be improved, but Luau semantics align with
-            #  Lua: continue jumps to condition.)
-            # Fall back: patch at repeat's cond_pc when it becomes known.
-            # The repeat handler stores the cond_pc back into continue_targets[-1].
-            # So we need a deferred patch list. Implement quickly:
-            self.fs._pending_continue = getattr(self.fs, '_pending_continue', [])
-            self.fs._pending_continue.append(ins)
+        ins = self._emit_jump()
+        if isinstance(target, list):
+            target.append(ins)
         else:
-            ins = self._emit_jump()
             self._patch_jump(ins, target)
 
     # ---- Function declaration ----
@@ -1051,9 +1149,8 @@ class VMCompiler:
         if isinstance(expr, (FunctionCall, MethodCall)):
             base = self.fs.free_reg
             self._compile_call(expr, want=want)
-            if want > 0:
-                self.fs.reserve_regs(want)
-            # If MULTRET, free_reg already advanced by call (top-of-stack semantic)
+            # Fixed results were already reserved by _compile_call. MULTRET is
+            # tracked by the runtime top, not another allocation of want regs.
             return base
         if isinstance(expr, VarargExpr):
             base = self.fs.reserve_regs(1)
@@ -1249,10 +1346,9 @@ class VMCompiler:
         # 'and': if left is falsy -> result is left, else right
         # 'or' : if left is truthy -> result is left, else right
         self._expr_to_reg(node.left, reg)
-        # TEST reg, B  : if (R[reg] <=> B) then ok else pc++
-        # For 'and': want truthy to continue; B=1
-        # For 'or' : want falsy to continue;  B=0
-        want = 1 if node.op == 'and' else 0
+        # TEST leaves the next JMP active when truthiness equals B. Jump over
+        # the RHS for a falsy 'and' operand or a truthy 'or' operand.
+        want = 0 if node.op == 'and' else 1
         self._emit('TEST', a=reg, b=want)
         jmp = self._emit_jump()
         self._expr_to_reg(node.right, reg)
@@ -1286,7 +1382,7 @@ class VMCompiler:
     # ---- Calls ----
 
     def _compile_call(self, node: Node, want: int):
-        """Compile a call. `want` is number of expected results, or MULTRET=0."""
+        """Compile a call: fixed results, MULTRET=0, or DISCARD=-1."""
         base = self.fs.free_reg
 
         if isinstance(node, MethodCall):
@@ -1337,11 +1433,13 @@ class VMCompiler:
                 b_field = 1  # 0 args -> B=1
 
         # C = want+1, with C=0 meaning MULTRET
-        c_field = 0 if want == MULTRET else (want + 1)
+        c_field = 1 if want == DISCARD else (0 if want == MULTRET else want + 1)
         self._emit('CALL', a=base, b=b_field, c=c_field)
 
         # After call: free_reg is at base + want (or untouched for MULTRET)
-        if want != MULTRET:
+        if want == DISCARD:
+            self.fs.free_reg = base
+        elif want != MULTRET:
             self.fs.free_reg = base + want
 
     # ---- Table constructor ----
@@ -1349,6 +1447,15 @@ class VMCompiler:
     _FPF = 50  # Fields-per-flush, like Lua 5.1
 
     def _compile_table_constructor(self, node: TableConstructor, reg: int):
+        # SETLIST reads the array buffer directly above its table register.
+        # Expressions such as numeric-for bounds may request a lower slot.
+        if self.fs.free_reg != reg + 1:
+            saved = self.fs.free_reg
+            temporary = self.fs.reserve_regs(1)
+            self._compile_table_constructor(node, temporary)
+            self._emit('MOVE', a=reg, b=temporary)
+            self.fs.free_reg = saved
+            return
         # Estimate sizes for NEWTABLE hints (non-binding)
         n_array = sum(1 for f in node.fields if f.key is None)
         n_hash = len(node.fields) - n_array
@@ -1359,21 +1466,18 @@ class VMCompiler:
         # Array-part fields: accumulate in consecutive temps and flush via SETLIST.
         array_buffer_base = None
         array_count = 0
-        flush_blocks = 0  # Number of SETLIST flushes done so far (FPF blocks)
-
-        last_field_is_multret = False
+        array_written = 0
         n_fields = len(node.fields)
 
         def flush_array(count: int, with_multret: bool = False):
-            nonlocal flush_blocks, array_buffer_base
+            nonlocal array_written, array_buffer_base
             if count == 0 and not with_multret:
                 return
-            # SETLIST A B C : R[A][offset+i] := R[A+i] for i=1..B
+            # SETLIST A B C : R[A][C+i] := R[A+i] for i=1..B
             #   B = count (0 for MULTRET)
-            #   C = block index (1-based)
-            block = flush_blocks + 1
-            self._emit('SETLIST', a=reg, b=(0 if with_multret else count), c=block)
-            flush_blocks = block
+            #   C = absolute array offset (partial flushes need no padding)
+            self._emit('SETLIST', a=reg, b=(0 if with_multret else count), c=array_written)
+            array_written += count
             # Free temps used by buffer
             if array_buffer_base is not None:
                 self.fs.free_reg = array_buffer_base
@@ -1384,17 +1488,10 @@ class VMCompiler:
                 # Array part — push value into next reg
                 if array_buffer_base is None:
                     array_buffer_base = self.fs.free_reg
-                is_last_array = True
-                # Check if there are more array entries after this
-                for j in range(i + 1, n_fields):
-                    if node.fields[j].key is None:
-                        is_last_array = False
-                        break
-                if is_last_array and self._is_multret_expr(field.value):
+                if i == n_fields - 1 and self._is_multret_expr(field.value):
                     self._expr_to_next_reg_multi(field.value, want=MULTRET)
                     flush_array(array_count + 1, with_multret=True)
                     array_count = 0
-                    last_field_is_multret = True
                 else:
                     self._expr_to_next_reg(field.value)
                     array_count += 1
@@ -1402,6 +1499,10 @@ class VMCompiler:
                         flush_array(array_count)
                         array_count = 0
             else:
+                # Commit preceding array fields before explicit numeric keys;
+                # otherwise a later SETLIST overwrites their newer values.
+                flush_array(array_count)
+                array_count = 0
                 # Hash part: emit immediately
                 if field.is_bracket_key:
                     # Bracket key: SETTABLE

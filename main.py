@@ -1,244 +1,176 @@
-"""
-Obscura — Advanced Luau Obfuscator for Roblox Studio
-==========================================================
-CLI Entry Point
-
-Usage:
-    python main.py --input script.lua --output script.obf.lua
-    python main.py --input ./scripts/ --output ./obfuscated/ --recursive
-    python main.py --input script.lua --level 4 --vm --antitamper --seed 12345
-"""
-
-import sys
+"""Command-line interface for Obscura, a Luau obfuscator for Roblox."""
+from pathlib import Path
 import time
-import pathlib
 import click
-from colorama import init as colorama_init, Fore, Style
-
-from config import ObfuscationConfig, ProtectionLevel, DeadCodeDensity
-from obfuscator import Obfuscator, ObfuscationError
-
-# Initialize colorama for Windows
-colorama_init(autoreset=True)
-
-# Banner
-BANNER = (
-    f"\n{Fore.CYAN}"
-    "   ___  _                                \n"
-    "  / _ \\| |__  ___  ___ _   _ _ __ __ _ \n"
-    " | | | | '_ \\/ __|/ __| | | | '__/ _` |\n"
-    " | |_| | |_) \\__ \\ (__| |_| | | | (_| |\n"
-    "  \\___/|_.__/|___/\\___|\\__,_|_|  \\__,_|\n"
-    f"{Style.RESET_ALL}"
-    f"  {Fore.WHITE}Advanced Luau Obfuscator for Roblox Studio{Style.RESET_ALL}\n"
-    f"  {Fore.LIGHTBLACK_EX}v1.0.1 -- 9-Layer Protection System{Style.RESET_ALL}\n"
-)
+from config import ObfuscationConfig, ProtectionLevel, DeadCodeDensity, lightweight_config
+from obfuscator import Obfuscator
 
 
-def print_status(msg: str, status: str = "info"):
-    """Print a colored status message."""
-    icons = {
-        "info": f"{Fore.CYAN}[*]",
-        "ok": f"{Fore.GREEN}[+]",
-        "warn": f"{Fore.YELLOW}[!]",
-        "error": f"{Fore.RED}[x]",
-        "vm": f"{Fore.MAGENTA}[VM]",
-    }
-    icon = icons.get(status, icons["info"])
-    click.echo(f"  {icon} {msg}{Style.RESET_ALL}")
+def show_all_help(ctx, param, value):
+    if not value or ctx.resilient_parsing:
+        return
+    hidden = [option for option in ctx.command.params
+              if isinstance(option, click.Option) and option.hidden]
+    try:
+        for option in hidden:
+            option.hidden = False
+        click.echo(ctx.get_help())
+    finally:
+        for option in hidden:
+            option.hidden = True
+    ctx.exit()
 
 
-def print_layer(name: str, enabled: bool):
-    """Print layer status."""
-    if enabled:
-        click.echo(f"    {Fore.GREEN}[+] {name}{Style.RESET_ALL}")
-    else:
-        click.echo(f"    {Fore.LIGHTBLACK_EX}[-] {name}{Style.RESET_ALL}")
+@click.command(context_settings={'help_option_names': ['-h', '--help']})
+@click.argument('source', required=False, type=click.Path(path_type=Path))
+@click.option('--output', '-o', 'output_path', type=click.Path(path_type=Path),
+              help='Output path. Default: NAME.obf.luau, or DIRECTORY-obfuscated.')
+@click.option('--mode', type=click.Choice(['lightweight', 'rename', 'native', 'vm']),
+              help='lightweight (default), rename, native, or vm (max profile).')
+@click.option('--vm-rolling/--vm-cached', default=None,
+              help='VM bytecode reads: rolling (default), or cached per function. Requires VM mode.')
+@click.option('--quiet', '-q', is_flag=True, help='Show errors only.')
+@click.version_option('1.1.0', prog_name='Obscura')
+@click.option('--help-all', is_flag=True, is_eager=True, expose_value=False,
+              callback=show_all_help, help='Show individual settings and older flags.')
+@click.option('--input', '-i', 'input_path', type=click.Path(path_type=Path),
+              hidden=True, help='Input file or directory; alternative to SOURCE.')
+@click.option('--level', '-l', type=click.IntRange(1, 4), hidden=True,
+              help='Presets: 1=basic native, 2=control flow, 3=native checks, 4=VM max.')
+@click.option('--vm', is_flag=True, hidden=True, help='Use VM execution (basic profile by default).')
+@click.option('--antitamper', is_flag=True, hidden=True, help='Enable native anti-tamper checks.')
+@click.option('--strings/--no-strings', default=None, hidden=True, help='Enable/disable native string encoding.')
+@click.option('--cff/--no-cff', default=None, hidden=True, help='Enable/disable native control-flow flattening.')
+@click.option('--deadcode/--no-deadcode', default=None, hidden=True, help='Enable/disable native dead code.')
+@click.option('--seed', type=int, hidden=True, help='Development seed for reproducible output. Omit for releases.')
+@click.option('--recursive', '-r', is_flag=True, hidden=True, help='Accepted for older commands; directories recurse automatically.')
+@click.option('--density', type=click.Choice(['low', 'medium', 'high']), hidden=True,
+              help='Native dead-code density (default: medium).')
+@click.option('--vm-hardening', type=click.Choice(['basic', 'client-max', 'max']), hidden=True,
+              help='VM profile. Requires --mode vm, --vm, or --level 4.')
+@click.option('--lightweight', is_flag=True, hidden=True, help='Alias for --mode lightweight.')
+@click.option('--rename-only', is_flag=True, hidden=True, help='Alias for --mode rename.')
+def main(source, input_path, output_path, mode, level, vm, antitamper, strings,
+         cff, deadcode, seed, recursive, density, vm_hardening, vm_rolling,
+         lightweight, rename_only, quiet):
+    """Obfuscate a Luau file or directory for Roblox.
 
+    Example: python main.py script.luau --mode vm
 
-@click.command()
-@click.option('--input', '-i', 'input_path', required=True,
-              help='Input file (.lua/.luau) or directory.')
-@click.option('--output', '-o', 'output_path', required=True,
-              help='Output file or directory.')
-@click.option('--level', '-l', type=click.IntRange(1, 4), default=None,
-              help='Protection level: 1=minimal, 2=standard, 3=maximum, 4=paranoid.')
-@click.option('--vm', is_flag=True, default=False,
-              help='Enable VM virtualization (Layer 9).')
-@click.option('--antitamper', is_flag=True, default=False,
-              help='Enable anti-tamper protection (Layer 8).')
-@click.option('--strings/--no-strings', default=True,
-              help='Enable/disable string encryption.')
-@click.option('--cff/--no-cff', default=True,
-              help='Enable/disable control flow flattening.')
-@click.option('--deadcode/--no-deadcode', default=True,
-              help='Enable/disable dead code injection.')
-@click.option('--seed', type=int, default=None,
-              help='Random seed for reproducible builds.')
-@click.option('--recursive', '-r', is_flag=True, default=False,
-              help='Process entire directory recursively.')
-@click.option('--density', type=click.Choice(['low', 'medium', 'high']),
-              default='medium', help='Dead code injection density.')
-@click.option('--vm-hardening', type=click.Choice(['basic', 'client-max', 'max']),
-              default=None, help='VM hardening profile.')
-@click.option('--lightweight', is_flag=True, default=False,
-              help='Extremely lightweight mode (minimal size overhead).')
-@click.option('--quiet', '-q', is_flag=True, default=False,
-              help='Suppress banner and verbose output.')
-def main(input_path, output_path, level, vm, antitamper, strings, cff,
-         deadcode, seed, recursive, density, vm_hardening, lightweight, quiet):
-    """Obscura — Advanced Luau Obfuscator for Roblox Studio"""
+    Keep the original source. Test generated code in Roblox Studio.
+    """
+    if source is not None and input_path is not None:
+        raise click.UsageError('Use SOURCE or --input, not both.')
+    input_p = source if source is not None else input_path
+    if input_p is None:
+        raise click.UsageError('Provide a Luau file or directory. See --help.')
+    if not input_p.exists():
+        raise click.ClickException(f'Input path not found: {input_p}')
+    if not input_p.is_file() and not input_p.is_dir():
+        raise click.ClickException(f'Input must be a file or directory: {input_p}')
 
-    if not quiet:
-        click.echo(BANNER)
-
-    # Build configuration
-    config = ObfuscationConfig()
-
-    if level is not None:
-        config.level = ProtectionLevel(level)
-        config._apply_level(config.level)
-
+    primary_modes = sum([mode is not None, level is not None, lightweight, rename_only])
+    if primary_modes > 1:
+        raise click.UsageError('Choose one of --mode, --level, --lightweight, or --rename-only.')
+    if mode is not None and vm:
+        raise click.UsageError('Use --mode vm or --vm, not both.')
     if lightweight:
-        config.level = ProtectionLevel.MINIMAL
-        config._apply_level(config.level)
-        config.obfuscate_numbers = False
-        config.control_flow_flatten = False
-        config.inject_dead_code = False
-        config.opaque_predicates = False
-        config.table_indirection = False
-        config.anti_tamper = False
-        config.virtualize = False
+        mode = 'lightweight'
+    elif rename_only:
+        mode = 'rename'
+    custom_native = antitamper or strings is not None or cff is not None or deadcode is not None or density is not None
+    if mode is None and level is None and not vm and not custom_native:
+        mode = 'lightweight'
+
+    if mode in ('lightweight', 'rename'):
+        if vm or vm_rolling is not None or antitamper or vm_hardening is not None or cff or deadcode or density is not None:
+            raise click.UsageError('Lightweight/rename modes cannot enable VM, anti-tamper, control-flow, or dead-code options.')
+        config = lightweight_config(seed=seed)
+        if mode == 'rename':
+            if strings:
+                raise click.UsageError('--mode rename cannot enable --strings.')
+            config.encrypt_strings = False
+        elif strings is not None:
+            config.encrypt_strings = strings
     else:
-        # Override individual toggles if specified
+        selected_level = 4 if mode == 'vm' else 3 if mode == 'native' else level
+        config = ObfuscationConfig(seed=seed,
+            level=ProtectionLevel(selected_level) if selected_level is not None else None,
+            virtualize=vm, vm_hardening=vm_hardening)
         if vm:
             config.virtualize = True
         if antitamper:
             config.anti_tamper = True
-        config.encrypt_strings = strings
-        config.control_flow_flatten = cff
-        config.inject_dead_code = deadcode
-        config.dead_code_density = DeadCodeDensity(density)
-        if vm_hardening is not None:
-            config.vm_hardening = vm_hardening
-            config.vm_lazy_constants = vm_hardening in ("client-max", "max")
-            config.vm_dynamic_keys = vm_hardening in ("client-max", "max")
-            config.vm_integrity_check = vm_hardening in ("client-max", "max")
+        for attribute, value in [('encrypt_strings', strings), ('control_flow_flatten', cff),
+                                 ('inject_dead_code', deadcode)]:
+            if value is not None:
+                setattr(config, attribute, value)
+        if density is not None:
+            config.dead_code_density = DeadCodeDensity(density)
+    if vm_hardening is not None and not config.virtualize:
+        raise click.UsageError('--vm-hardening requires --mode vm, --vm, or --level 4.')
+    if vm_rolling is not None:
+        if not config.virtualize:
+            raise click.UsageError('--vm-rolling/--vm-cached requires --mode vm, --vm, or --level 4.')
+        config.vm_predecode_bytecode = not vm_rolling
 
-    if seed is not None:
-        config.seed = seed
-    config._init_rng()
+    directory_name = input_p.resolve() if input_p.is_dir() else None
+    output_suffix = input_p.suffix if input_p.suffix.lower() in {'.lua', '.luau'} else '.luau'
+    output_p = output_path or (directory_name.with_name(directory_name.name + '-obfuscated') if directory_name
+                              else input_p.with_name(input_p.stem + '.obf' + output_suffix))
+    input_absolute, output_absolute = input_p.resolve(), output_p.resolve()
+    if input_absolute == output_absolute:
+        raise click.UsageError('Output must differ from input; keep your original source.')
+    if input_p.is_dir():
+        if input_absolute in output_absolute.parents:
+            raise click.UsageError('Keep the output directory outside the input directory.')
+        if output_p.exists() and not output_p.is_dir():
+            raise click.UsageError('Directory input needs a directory output.')
+    elif output_p.is_dir():
+        raise click.UsageError('File input needs a file output.')
 
-    # Print configuration
-    if not quiet:
-        print_status(f"Build ID: {Fore.YELLOW}{config._build_id}", "info")
-        print_status(f"Seed: {Fore.YELLOW}{config.seed}", "info")
-        click.echo(f"\n  {Fore.WHITE}Layers:{Style.RESET_ALL}")
-        print_layer("Layer 1: Identifier Renaming", config.rename_identifiers)
-        print_layer("Layer 2: String Encryption", config.encrypt_strings)
-        print_layer("Layer 3: Number Obfuscation (MBA)", config.obfuscate_numbers)
-        print_layer("Layer 4: Control Flow Flattening", config.control_flow_flatten)
-        print_layer("Layer 5: Opaque Predicates", config.opaque_predicates)
-        print_layer("Layer 6: Dead Code Injection", config.inject_dead_code)
-        print_layer("Layer 7: Table Indirection", config.table_indirection)
-        print_layer("Layer 8: Anti-Tamper", config.anti_tamper)
-        print_layer("Layer 9: VM Virtualization", config.virtualize)
-        if config.virtualize:
-            print_status(f"VM hardening: {Fore.YELLOW}{config.vm_hardening}", "vm")
-        click.echo()
-
-    # Create obfuscator
+    started = time.perf_counter()
     obfuscator = Obfuscator(config)
-
-    input_p = pathlib.Path(input_path)
-    output_p = pathlib.Path(output_path)
-
-    start_time = time.time()
-    files_processed = 0
-    files_failed = 0
-
-    if input_p.is_file():
-        # Single file mode
-        files_processed, files_failed = process_file(
-            input_p, output_p, obfuscator, quiet
-        )
-    elif input_p.is_dir():
-        if not recursive:
-            print_status("Input is a directory. Use --recursive flag.", "error")
-            sys.exit(1)
-        files_processed, files_failed = process_directory(
-            input_p, output_p, obfuscator, quiet
-        )
+    if input_p.is_dir():
+        processed, failed = process_directory(input_p, output_p, obfuscator, quiet)
+        if not quiet:
+            click.echo(f'{processed} files written to {output_p}; {failed} failed ({time.perf_counter() - started:.2f}s).')
     else:
-        print_status(f"Input path not found: {input_path}", "error")
-        sys.exit(1)
-
-    elapsed = time.time() - start_time
-
-    # Summary
-    if not quiet:
-        click.echo()
-        click.echo(f"  {Fore.WHITE}{'=' * 50}{Style.RESET_ALL}")
-        print_status(
-            f"Completed in {Fore.YELLOW}{elapsed:.2f}s{Style.RESET_ALL} -- "
-            f"{Fore.GREEN}{files_processed} files processed"
-            f"{Style.RESET_ALL}, {Fore.RED}{files_failed} failed{Style.RESET_ALL}",
-            "ok"
-        )
+        processed, failed = process_file(input_p, output_p, obfuscator, quiet)
+    if failed:
+        raise click.exceptions.Exit(1)
 
 
-def process_file(input_path: pathlib.Path, output_path: pathlib.Path,
+def process_file(input_path: Path, output_path: Path,
                  obfuscator: Obfuscator, quiet: bool) -> tuple:
-    """Process a single file."""
+    """Generate before writing so failed transformations do not replace files."""
     try:
         source = input_path.read_text(encoding='utf-8')
-        if not quiet:
-            print_status(f"Processing: {Fore.WHITE}{input_path.name}", "info")
-
         result = obfuscator.obfuscate(source)
-
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_text(result, encoding='utf-8')
-
-        orig_size = len(source)
-        new_size = len(result)
-        ratio = new_size / orig_size if orig_size > 0 else 0
-
         if not quiet:
-            print_status(
-                f"Output: {Fore.WHITE}{output_path.name} "
-                f"{Fore.LIGHTBLACK_EX}({orig_size}B -> {new_size}B, {ratio:.1f}x)",
-                "ok"
-            )
-        return (1, 0)
-
-    except Exception as e:
-        print_status(f"Failed: {input_path.name} -- {e}", "error")
-        return (0, 1)
+            click.echo(f'{input_path} -> {output_path} ({len(source.encode("utf-8")):,} -> {len(result.encode("utf-8")):,} bytes)')
+        return 1, 0
+    except Exception as error:
+        click.echo(f'Error: {input_path}: {error}', err=True)
+        return 0, 1
 
 
-def process_directory(input_dir: pathlib.Path, output_dir: pathlib.Path,
+def process_directory(input_dir: Path, output_dir: Path,
                       obfuscator: Obfuscator, quiet: bool) -> tuple:
-    """Process a directory recursively."""
-    total_ok = 0
-    total_fail = 0
-
-    extensions = {'.lua', '.luau'}
-
-    for lua_file in sorted(input_dir.rglob("*")):
-        if lua_file.suffix.lower() not in extensions:
-            continue
-        if lua_file.is_dir():
-            continue
-
-        relative = lua_file.relative_to(input_dir)
-        out_file = output_dir / relative
-
-        ok, fail = process_file(lua_file, out_file, obfuscator, quiet)
+    """Preserve relative paths while processing both Luau file extensions."""
+    files = [path for path in sorted(input_dir.rglob('*'))
+             if path.is_file() and path.suffix.lower() in {'.lua', '.luau'}
+             and not path.stem.lower().endswith('.obf')]
+    if not files:
+        raise click.ClickException(f'No .lua or .luau files found in {input_dir}')
+    total_ok = total_fail = 0
+    for source in files:
+        ok, fail = process_file(source, output_dir / source.relative_to(input_dir), obfuscator, quiet)
         total_ok += ok
         total_fail += fail
-
-    return (total_ok, total_fail)
+    return total_ok, total_fail
 
 
 if __name__ == '__main__':

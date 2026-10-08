@@ -2,13 +2,14 @@
 Obscura VM Constant Pool
 ==============================
 Holds and deduplicates literal values (numbers, strings, booleans, nil)
-and provides per-build XOR encryption for string content.
+and provides per-build encoding for string and numeric content.
 
-The interpreter receives the pool as a Luau table literal where strings
-have been XOR-encrypted with a rolling key, and decrypts them lazily on
-first use (or eagerly at startup, depending on configuration).
+Hardened numeric values use round-trip decimal text in the same encrypted
+pool as strings. The interpreter decodes each function pool once, preserving
+direct numeric lookups afterward.
 """
 
+import math
 import random
 from typing import List, Any, Dict
 
@@ -20,7 +21,7 @@ class ConstantPool:
         self.rng = rng
         self.constants: List[Any] = []
         self._index: Dict[Any, int] = {}
-        # Per-build rolling XOR key (4-16 bytes)
+        # Per-build repeating XOR key (4-16 bytes)
         key_len = self.rng.randint(4, 16)
         self.key: List[int] = [self.rng.randint(1, 255) for _ in range(key_len)]
 
@@ -41,7 +42,7 @@ class ConstantPool:
         if isinstance(value, bool):
             return ('bool', value)
         if isinstance(value, (int, float)):
-            return ('num', float(value))
+            return ('num', float(value).hex())
         if isinstance(value, str):
             return ('str', value)
         return ('other', repr(value))
@@ -49,17 +50,38 @@ class ConstantPool:
     # ---- Encryption ----
 
     def encrypt_string(self, s: str) -> str:
-        """Return an escaped Luau string literal body with rolling-XOR encryption."""
+        """Return an escaped Luau string body with repeating multi-byte XOR."""
         klen = len(self.key)
         out_chars = []
-        for i, byte in enumerate(s.encode('utf-8')):
+        for i, byte in enumerate(s.encode('utf-8','surrogateescape')):
             k = self.key[i % klen]
-            out_chars.append(f"\\{byte ^ k}")
+            out_chars.append(f"\\{byte ^ k:03d}")
         return ''.join(out_chars)
 
     # ---- Luau emission ----
 
-    def to_luau_table(self) -> str:
+    def number_text(self, value) -> str:
+        """Round-trip IEEE doubles without arithmetic identities or precision loss."""
+        if math.isinf(value):
+            return '-inf' if value < 0 else 'inf'
+        if math.isnan(value):
+            return 'nan'
+        return repr(value)
+
+    def encoded_values(self, encode_numbers=False):
+        values, pending = [], []
+        for value in self.constants:
+            numeric = isinstance(value, (int, float)) and not isinstance(value, bool)
+            kind = 2 if numeric and encode_numbers else (1 if isinstance(value, str) else 0)
+            text = self.number_text(value) if kind == 2 else value
+            if kind:
+                raw = text.encode('utf-8', 'surrogateescape')
+                value = bytes(b ^ self.key[i % len(self.key)] for i,b in enumerate(raw))
+            values.append(value)
+            pending.append(kind)
+        return values, pending
+
+    def to_luau_table(self, encode_numbers=False) -> str:
         """Generate a Luau table literal containing the (encrypted) constants."""
         entries = []
         for c in self.constants:
@@ -68,6 +90,12 @@ class ConstantPool:
             elif isinstance(c, bool):
                 entries.append("true" if c else "false")
             elif isinstance(c, (int, float)):
+                if encode_numbers:
+                    entries.append(f'"{self.encrypt_string(self.number_text(c))}"')
+                    continue
+                if not math.isfinite(c):
+                    entries.append('(0/0)' if math.isnan(c) else ('(-1/0)' if c < 0 else '(1/0)'))
+                    continue
                 # Preserve integers when possible
                 if isinstance(c, int) or (isinstance(c, float) and c.is_integer()):
                     entries.append(str(int(c)))

@@ -2,7 +2,7 @@
 Obscura Parser
 ==================
 Recursive-descent parser: token stream → AST.
-Handles all common Luau constructs. Gracefully skips type annotations.
+Handles a supported subset of Luau, including basic type annotations.
 """
 
 from typing import List, Optional
@@ -328,7 +328,7 @@ class Parser:
         """Parse an expression statement or assignment."""
         expr = self._parse_suffixed_expr()
 
-        # Handle Luau compound assignments (desugar: expr += val -> expr = expr + val)
+        # Preserve Luau's single evaluation of compound-assignment destinations.
         compound_map = {
             TokenType.PLUS_ASSIGN: '+',
             TokenType.MINUS_ASSIGN: '-',
@@ -343,13 +343,10 @@ class Parser:
             op = compound_map[self._current().type]
             self.pos += 1
             value = self._parse_expression()
-            
-            desugared_value = BinaryOp(
-                op=op, left=expr, right=value,
-                line=expr.line, col=expr.col
-            )
-            return AssignStatement(
-                targets=[expr], values=[desugared_value],
+            if not isinstance(expr, (Identifier, IndexExpr, MemberExpr)):
+                raise ParseError('Invalid compound assignment target', self._current())
+            return CompoundAssignStatement(
+                targets=[expr], values=[value], op=op,
                 line=expr.line, col=expr.col
             )
 

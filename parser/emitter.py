@@ -66,6 +66,9 @@ class Emitter:
         vals = ",".join(self.emit(v) for v in node.values)
         return f"{targets}={vals}"
 
+    def _emit_CompoundAssignStatement(self, node: CompoundAssignStatement) -> str:
+        return f"{self.emit(node.targets[0])}{node.op}={self.emit(node.values[0])}"
+
     def _emit_DoBlock(self, node: DoBlock) -> str:
         body = self.emit_block(node.body)
         return f"do {body} end"
@@ -150,22 +153,16 @@ class Emitter:
         return node.value
 
     def _emit_StringLiteral(self, node: StringLiteral) -> str:
-        # Escape the value properly for Luau string output
-        escaped = (node.value
-            .replace('\\', '\\\\')
-            .replace('"', '\\"')
-            .replace('\n', '\\n')
-            .replace('\r', '\\r')
-            .replace('\0', '\\0')
-            .replace('\t', '\\t')
-        )
-        # Ensure all characters are ASCII-printable; escape others
+        # Luau strings contain bytes. Surrogate escapes represent explicit byte
+        # literals; ordinary Unicode source characters are encoded as UTF-8.
         result = []
-        for ch in escaped:
-            if ord(ch) < 32 or ord(ch) > 126:
-                result.append(f'\\{ord(ch)}')
+        for byte in node.value.encode('utf-8','surrogateescape'):
+            if byte in (34,92):
+                result.append('\\'+chr(byte))
+            elif byte < 32 or byte > 126:
+                result.append(f'\\{byte:03d}')
             else:
-                result.append(ch)
+                result.append(chr(byte))
         return '"' + ''.join(result) + '"'
 
     def _emit_BooleanLiteral(self, node: BooleanLiteral) -> str:

@@ -57,9 +57,69 @@ class ControlFlowFlattener:
             self._visit_children(stmt)
 
         # Then flatten this block if it has enough statements
-        if len(block.body) >= self.min_blocks:
+        if (len(block.body) >= self.min_blocks
+                and not self._exits_enclosing_loop(block)
+                and self._can_hoist_locals(block)):
             flattened = self._flatten_block(block.body)
             block.body = flattened
+
+    def _can_hoist_locals(self, block: Block) -> bool:
+        """Preserve declarations whose original lexical position matters.
+
+        Hoisting a later local can steal earlier references to an outer/global
+        name. Hoisting two declarations with the same name can also merge the
+        bindings captured by closures. Leave these blocks in native control flow.
+        Nested identifier references are included conservatively.
+        """
+        declared = set()
+        referenced = set()
+
+        def identifiers(node):
+            if isinstance(node, Identifier):
+                return {node.name}
+            names = set()
+            if isinstance(node, Node):
+                for value in vars(node).values():
+                    names.update(identifiers(value))
+            elif isinstance(node, list):
+                for child in node:
+                    names.update(identifiers(child))
+            return names
+
+        for stmt in block.body:
+            names = []
+            if isinstance(stmt, LocalStatement):
+                names = stmt.names
+                # Initializers execute before the new locals are in scope.
+                if set(names) & identifiers(stmt.values):
+                    return False
+            elif (isinstance(stmt, FunctionDecl) and stmt.is_local
+                  and isinstance(stmt.name, Identifier)):
+                names = [stmt.name.name]
+            if len(set(names)) != len(names) or set(names) & (declared | referenced):
+                return False
+            declared.update(names)
+            referenced.update(identifiers(stmt))
+        return True
+
+    def _exits_enclosing_loop(self, node: Node) -> bool:
+        """A dispatcher loop would steal the target of these break/continues.
+
+        Stop at original nested loops and functions: their exits have their own
+        targets. Their bodies are visited separately by _visit_children.
+        """
+        if isinstance(node, (BreakStatement, ContinueStatement)):
+            return True
+        if isinstance(node, (WhileLoop, RepeatUntil, NumericFor, GenericFor,
+                             FunctionDecl, FunctionExpr)):
+            return False
+        for value in vars(node).values():
+            if isinstance(value, Node) and self._exits_enclosing_loop(value):
+                return True
+            if isinstance(value, list) and any(isinstance(child, Node) and
+                                              self._exits_enclosing_loop(child) for child in value):
+                return True
+        return False
 
     def _visit_children(self, node: Node):
         """Recurse into child nodes that contain blocks."""

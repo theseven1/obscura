@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional
 import random
-import time
+import secrets
 
 
 class ProtectionLevel(Enum):
@@ -16,7 +16,7 @@ class ProtectionLevel(Enum):
     MINIMAL = 1    # Layers 1-3: identifiers, strings, numbers
     STANDARD = 2   # Layers 1-6: + CFF, predicates, dead code
     MAXIMUM = 3    # Layers 1-8: + indirection, anti-tamper
-    PARANOID = 4   # All 9 layers including custom VM
+    PARANOID = 4   # Separate VM pipeline with maximum hardening
 
 
 class DeadCodeDensity(Enum):
@@ -53,6 +53,7 @@ class ObfuscationConfig:
     # String encryption
     use_string_table: bool = True         # Centralized string table vs inline
     double_encrypt: bool = False          # Double-layer encryption
+    string_decode_mode: str = "lazy"      # lazy cache | eager pool (no hot-path calls)
 
     # Number obfuscation
     mba_depth: int = 2                    # Expression nesting depth (1-3)
@@ -74,15 +75,22 @@ class ObfuscationConfig:
     wrap_in_iife: bool = True
 
     # VM
-    vm_opcode_count: int = 30             # Number of VM instructions
-    vm_obfuscate_interpreter: bool = True # Apply layers 1-6 to the VM stub
-    vm_hardening: str = "basic"           # basic | client-max | max
-    vm_lazy_constants: bool = False       # Decode VM string constants on demand
-    vm_dynamic_keys: bool = False         # Reconstruct VM keys from split fragments
-    vm_integrity_check: bool = False      # Verify encrypted VM bytecode before execution
+    vm_hardening: Optional[str] = None    # basic | client-max | max; resolved below
+    vm_lazy_constants: Optional[bool] = None
+    vm_dynamic_keys: Optional[bool] = None
+    vm_integrity_check: Optional[bool] = None
+    vm_operand_layouts: Optional[bool] = None
+    vm_partition_constants: Optional[bool] = None
+    vm_per_proto_keys: Optional[bool] = None
+    vm_fuse_instructions: Optional[bool] = None
+    vm_extended_fusion: Optional[bool] = None
+    vm_encode_numbers: Optional[bool] = None
+    vm_handler_variants: Optional[bool] = None
+    vm_superinstructions: Optional[bool] = None
+    vm_predecode_bytecode: bool = False   # Rolling reads by default; True caches decoded bytecode
 
     # --- Global Settings ---
-    seed: Optional[int] = None            # None = unique per run
+    seed: Optional[int] = None            # None = private 256-bit OS-random seed
     minify: bool = True                   # Minify output
     strip_comments: bool = True           # Remove all comments
     strip_types: bool = True              # Remove Luau type annotations
@@ -95,6 +103,7 @@ class ObfuscationConfig:
         """Apply protection level presets and initialize RNG."""
         if self.level is not None:
             self._apply_level(self.level)
+        self._resolve_vm_profile()
         self._init_rng()
 
     def _apply_level(self, level: ProtectionLevel):
@@ -110,17 +119,43 @@ class ObfuscationConfig:
         self.anti_tamper = lv >= ProtectionLevel.MAXIMUM.value
         self.virtualize = lv >= ProtectionLevel.PARANOID.value
         if lv >= ProtectionLevel.PARANOID.value:
-            self.vm_hardening = "client-max"
-            self.vm_lazy_constants = True
-            self.vm_dynamic_keys = True
-            self.vm_integrity_check = True
+            self.vm_hardening = self.vm_hardening or "max"
+
+    def _resolve_vm_profile(self):
+        """One resolver for CLI/API, preserving explicit per-feature overrides."""
+        self.vm_hardening = self.vm_hardening or "basic"
+        if self.vm_hardening not in ('basic', 'client-max', 'max'):
+            raise ValueError(f'Unknown VM hardening profile: {self.vm_hardening}')
+        hardened = self.vm_hardening != 'basic'
+        defaults = {
+            'vm_lazy_constants': hardened,
+            'vm_dynamic_keys': hardened,
+            'vm_integrity_check': hardened,
+            'vm_operand_layouts': hardened,
+            'vm_partition_constants': hardened,
+            'vm_per_proto_keys': hardened,
+            'vm_fuse_instructions': hardened,
+            'vm_extended_fusion': self.vm_hardening == 'max',
+            'vm_encode_numbers': hardened,
+            'vm_handler_variants': hardened,
+            'vm_superinstructions': hardened,
+        }
+        for name,value in defaults.items():
+            if getattr(self,name) is None:
+                setattr(self,name,value)
 
     def _init_rng(self):
         """Initialize the random number generator."""
         if self.seed is None:
-            self.seed = int(time.time() * 1000) & 0xFFFFFFFF
+            self.seed = secrets.randbits(256)
+            # Independent randomness; hashing a small seed would expose a
+            # searchable identifier. Neither seed nor RNG state is published.
+            self._build_id = secrets.token_hex(8)
+        else:
+            # Explicit development seeds retain byte-for-byte reproducibility
+            # without putting their value into released Lua or normal logs.
+            self._build_id = 'development'
         self._rng = random.Random(self.seed)
-        self._build_id = f"{self.seed:08x}"
 
     def get_rng(self) -> random.Random:
         """Get the seeded RNG instance for deterministic output."""
@@ -133,6 +168,14 @@ def minimal_config(**kwargs) -> ObfuscationConfig:
     """Quick config: identifier renaming + string encryption + number obfuscation."""
     return ObfuscationConfig(level=ProtectionLevel.MINIMAL, **kwargs)
 
+
+def lightweight_config(**kwargs) -> ObfuscationConfig:
+    """Native Luau control flow with identifiers and startup-only string decoding."""
+    config = ObfuscationConfig(level=ProtectionLevel.MINIMAL, **kwargs)
+    config.obfuscate_numbers = False
+    config.string_decode_mode = "eager"
+    return config
+
 def standard_config(**kwargs) -> ObfuscationConfig:
     """Quick config: layers 1-6 (no table indirection, no anti-tamper, no VM)."""
     return ObfuscationConfig(level=ProtectionLevel.STANDARD, **kwargs)
@@ -142,5 +185,5 @@ def maximum_config(**kwargs) -> ObfuscationConfig:
     return ObfuscationConfig(level=ProtectionLevel.MAXIMUM, **kwargs)
 
 def paranoid_config(**kwargs) -> ObfuscationConfig:
-    """Quick config: all 9 layers including custom VM."""
+    """Quick config: separate VM pipeline with maximum hardening."""
     return ObfuscationConfig(level=ProtectionLevel.PARANOID, **kwargs)
